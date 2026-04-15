@@ -730,13 +730,40 @@ def app():
             plt.close(fig3)
 
         with c4:
-            fig4, ax4 = plt.subplots(figsize=(8, 4.5))
-            ax4.plot(hourly_df["datetime"].iloc[:168], hourly_df["pv_generation_mwh"].iloc[:168], label="PV")
-            ax4.plot(hourly_df["datetime"].iloc[:168], hourly_df["pv_to_battery_mwh"].iloc[:168], label="Charge PV->batt")
-            ax4.plot(hourly_df["datetime"].iloc[:168], hourly_df["battery_discharge_mwh"].iloc[:168], label="Décharge batt")
-            ax4.set_title("Première semaine - flux horaires")
-            ax4.set_ylabel("MWh")
-            ax4.legend()
+            # --- Sélection première semaine de juin ---
+            june_mask = (hourly_df["datetime"].dt.month == 6)
+            june_df = hourly_df[june_mask].copy()
+            week_df = june_df.iloc[:168]
+
+            fig4, ax1 = plt.subplots(figsize=(10, 5))
+
+            # --- Flux énergie ---
+            ax1.plot(week_df["datetime"], week_df["pv_direct_mwh"], label="PV → Réseau")
+            ax1.plot(week_df["datetime"], week_df["pv_to_battery_mwh"], label="PV → Batterie")
+            ax1.plot(week_df["datetime"], week_df["grid_charge_mwh"], label="Réseau → Batterie")
+            ax1.plot(week_df["datetime"], week_df["battery_discharge_mwh"], label="Batterie → Réseau")
+
+            ax1.set_ylabel("Flux énergie (MWh)")
+            ax1.set_xlabel("Date")
+
+            # --- Prix (axe secondaire) ---
+            ax2 = ax1.twinx()
+            ax2.plot(
+                week_df["datetime"],
+                week_df["battery_sell_price_eur_per_mwh"],
+                linestyle="--",
+                alpha=0.7,
+                label="Prix spot"
+            )
+            ax2.set_ylabel("Prix (EUR/MWh)")
+
+            # --- Légende combinée ---
+            lines_1, labels_1 = ax1.get_legend_handles_labels()
+            lines_2, labels_2 = ax2.get_legend_handles_labels()
+            ax1.legend(lines_1 + lines_2, labels_1 + labels_2, loc="upper right")
+
+            ax1.set_title("Flux énergétiques et prix - Première semaine de juin")
+
             st.pyplot(fig4)
             plt.close(fig4)
 
