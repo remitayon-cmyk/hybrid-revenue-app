@@ -187,7 +187,6 @@ def optimize_dispatch_dp(inputs: SimulationInputs) -> Dict[str, np.ndarray]:
 
     soc_steps = int(max(21, inputs.soc_steps))
     soc_grid = np.linspace(0.0, inputs.batt_energy_mwh, soc_steps)
-    cycle_budget = max_total_discharge
 
     def nearest_state_index(value: float) -> int:
         value = min(max(value, 0.0), inputs.batt_energy_mwh)
@@ -230,7 +229,6 @@ def optimize_dispatch_dp(inputs: SimulationInputs) -> Dict[str, np.ndarray]:
 
             for j in transitions[i]:
                 delta_soc = soc_grid[j] - soc_i
-                reward = pv_base_revenue
                 
                 # --- Calcul des flux candidats ---
                 pv_direct_candidate = pv_t
@@ -250,7 +248,7 @@ def optimize_dispatch_dp(inputs: SimulationInputs) -> Dict[str, np.ndarray]:
                     if grid_charge > 1e-9 and grid_buy_t > charge_threshold:
                         continue
                     
-                   # no negative spread charging (anti-arbitrage)
+                    # no negative spread charging (anti-arbitrage)
                     MIN_SPREAD = 10  # €/MWh
                     if pv_t < charge_input and (batt_sell_t - grid_buy_t) < MIN_SPREAD:
                         continue
@@ -279,11 +277,15 @@ def optimize_dispatch_dp(inputs: SimulationInputs) -> Dict[str, np.ndarray]:
                     if excess > 0:
                         discharge_candidate = max(discharge_candidate - excess, 0.0)
 
-                    cycle_penalty = 0.0
+                # 💡 NOUVEAU : Écrêtage économique (curtailment)
+                if pv_price_t < 0:
+                    pv_direct_candidate = 0.0
 
-                    if discharge_candidate > 0:
-                        throughput = abs(delta_soc)
-                        cycle_penalty = (throughput / inputs.batt_energy_mwh) * inputs.cycle_cost_eur_per_mwh
+                cycle_penalty = 0.0
+
+                if discharge_candidate > 0:
+                    throughput = abs(delta_soc)
+                    cycle_penalty = (throughput / inputs.batt_energy_mwh) * inputs.cycle_cost_eur_per_mwh
 
                 # --- Calcul du reward ---
                 reward = pv_direct_candidate * pv_price_t
@@ -299,8 +301,11 @@ def optimize_dispatch_dp(inputs: SimulationInputs) -> Dict[str, np.ndarray]:
                     reward = pv_direct_candidate * pv_price_t + discharge_candidate * batt_sell_t
                     reward -= cycle_penalty
                     
-                total_val = reward + value_next[j]
-                if total_val > best_val:
+                # 💡 NOUVEAU : Ajout de l'epsilon pour privilégier le SOC si indifférence
+                EPSILON_SOC = 1e-4
+                total_val = reward + value_next[j] + (soc_grid[j] * EPSILON_SOC)
+                
+                if total_val > best_val + 1e-9:
                     best_val = total_val
                     best_j = int(j)
 
@@ -321,6 +326,7 @@ def optimize_dispatch_dp(inputs: SimulationInputs) -> Dict[str, np.ndarray]:
     pv_to_batt = np.zeros(T, dtype=float)
     grid_charge = np.zeros(T, dtype=float)
     discharge = np.zeros(T, dtype=float)
+    pv_curtailed = np.zeros(T, dtype=float)  # 💡 NOUVEAU : Suivi de l'écrêtage
     batt_sale_revenue = np.zeros(T, dtype=float)
     grid_charge_cost = np.zeros(T, dtype=float)
     pv_direct_revenue = np.zeros(T, dtype=float)
@@ -348,20 +354,29 @@ def optimize_dispatch_dp(inputs: SimulationInputs) -> Dict[str, np.ndarray]:
             discharge[t] = (-delta_soc) * inputs.eta_discharge
             pv_direct_candidate = pv[t]
 
-        # --- CONTRAINTE GRID ---
+        # --- CONTRAINTE GRID & CURTAILMENT ---
         total_export = pv_direct_candidate + discharge[t]
+        curtailed_grid = 0.0
 
         if total_export > inputs.grid_export_limit_mw:
             excess = total_export - inputs.grid_export_limit_mw
 
             reduction_pv = min(excess, pv_direct_candidate)
             pv_direct_candidate -= reduction_pv
+            curtailed_grid += reduction_pv
             excess -= reduction_pv
 
             if excess > 0:
                 discharge[t] = max(discharge[t] - excess, 0.0)
 
+        # 💡 NOUVEAU : Écrêtage économique
+        curtailed_eco = 0.0
+        if pv_price[t] < 0:
+            curtailed_eco = pv_direct_candidate
+            pv_direct_candidate = 0.0
+
         pv_direct[t] = max(pv_direct_candidate, 0.0)
+        pv_curtailed[t] = curtailed_grid + curtailed_eco  # Cumul physique + économique
 
         pv_direct_revenue[t] = pv_direct[t] * pv_price[t]
         batt_sale_revenue[t] = discharge[t] * batt_sell[t]
@@ -381,6 +396,7 @@ def optimize_dispatch_dp(inputs: SimulationInputs) -> Dict[str, np.ndarray]:
         "pv_to_batt": pv_to_batt,
         "grid_charge": grid_charge,
         "discharge": discharge,
+        "pv_curtailed": pv_curtailed,  # 💡 NOUVEAU
         "pv_direct_revenue": pv_direct_revenue,
         "batt_sale_revenue": batt_sale_revenue,
         "grid_charge_cost": grid_charge_cost,
@@ -393,6 +409,7 @@ def optimize_dispatch_dp(inputs: SimulationInputs) -> Dict[str, np.ndarray]:
         "energy_sold_total_mwh": np.array([pv_direct.sum() + discharge.sum()]),
         "energy_shifted_mwh": np.array([discharge.sum()]),
         "pv_direct_sold_mwh": np.array([pv_direct.sum()]),
+        "energy_curtailed_mwh": np.array([pv_curtailed.sum()]),  # 💡 NOUVEAU
     }
     return result
 
@@ -407,6 +424,7 @@ def build_summary_table(result: Dict[str, np.ndarray], pv_stats: Dict[str, float
         ("Énergie totale vendue", float(result["energy_sold_total_mwh"][0]), "MWh"),
         ("Énergie shiftée par batterie", float(result["energy_shifted_mwh"][0]), "MWh"),
         ("Énergie PV vendue directement", float(result["pv_direct_sold_mwh"][0]), "MWh"),
+        ("Énergie PV écrêtée (prix < 0 ou limite réseau)", float(result["energy_curtailed_mwh"][0]), "MWh"), # 💡 NOUVEAU
         ("Cycles équivalents batterie", float(result["equivalent_cycles"][0]), "cycles/an"),
         ("Production PV théorique brute", float(pv_stats["annual_dc_mwh"]), "MWh"),
         ("Production PV nette valorisable", float(pv_stats["annual_net_mwh"]), "MWh"),
@@ -426,6 +444,7 @@ def monthly_dataframe(result: Dict[str, np.ndarray]) -> pd.DataFrame:
         "shifted_mwh": result["discharge"],
         "grid_charge_mwh": result["grid_charge"],
         "pv_to_batt_mwh": result["pv_to_batt"],
+        "curtailed_mwh": result["pv_curtailed"],  # 💡 NOUVEAU
     })
     df["month"] = df["datetime"].dt.strftime("%Y-%m")
     monthly = df.groupby("month", as_index=False).sum(numeric_only=True)
@@ -453,357 +472,4 @@ def app():
     with st.expander("Hypothèses structurantes", expanded=False):
         st.markdown(
             """
-            - Simulation **horaire sur 8760h**.
-            - La batterie peut **charger depuis le PV et/ou depuis le réseau**.
-            - Le moteur choisit la meilleure valorisation économique entre vente immédiate du PV, stockage PV et charge réseau.
-            - Les **revenus de services système la nuit** sont ajoutés comme un **revenu fixe par nuit**, sans contrainte de capacité ni de SOC.
-            - Le profil solaire standard est une **forme France standardisée**. Un CSV 8760 peut la remplacer.
-            - L'optimisation utilise une **programmation dynamique discrétisée sur le SOC**.
-            """
-        )
-
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        batt_power_mw = st.number_input("Puissance batterie utile (MW)", min_value=0.0, value=50.0, step=1.0)
-        batt_energy_mwh = st.number_input("Capacité batterie utile (MWh)", min_value=0.0, value=100.0, step=1.0)
-        pv_dc_mw = st.number_input("Puissance PV DC (MWc)", min_value=0.0, value=100.0, step=1.0)
-        productible = st.number_input("Productible PV (kWh/kWc/an)", min_value=0.0, value=1200.0, step=10.0)
-        grid_export_limit_mw = st.number_input("Limite injection réseau (MW)", min_value=0.0, value=pv_dc_mw, step=1.0)
-        cycle_cost = st.number_input("Coût de cycle batterie (EUR/MWh)", value=5.0)
-        charge_quantile = st.slider("Quantile charge (%)", 0, 50, 20)
-        discharge_quantile = st.slider("Quantile décharge (%)", 0, 50, 20)
-        max_cycles = st.number_input("Cycles max / an", value=300.0)
-
-    with col2:
-        pv_losses_pct = st.number_input("Pertes système PV (%)", min_value=0.0, max_value=100.0, value=8.0, step=0.5)
-        availability_pct = st.number_input("Disponibilité globale centrale (%)", min_value=0.0, max_value=100.0, value=98.0, step=0.1)
-        eta_charge = st.number_input("Rendement de charge batterie (%)", min_value=1.0, max_value=100.0, value=95.0, step=0.5) / 100.0
-        eta_discharge = st.number_input("Rendement de décharge batterie (%)", min_value=1.0, max_value=100.0, value=95.0, step=0.5) / 100.0
-
-    with col3:
-        nightly_bess_revenue = st.number_input("Revenu services système nuit (EUR/nuit)", min_value=0.0, value=0.0, step=10.0)
-        soc_steps = st.slider("Nombre de pas de SOC pour l'optimisation", min_value=21, max_value=201, value=101, step=10)
-        initial_soc = st.number_input("SOC initial batterie (MWh)", min_value=0.0, value=0.0, step=1.0)
-        final_soc = st.number_input("SOC final cible batterie (MWh)", min_value=0.0, value=0.0, step=1.0)
-
-    st.subheader("Courbe solaire 8760h")
-    solar_mode = st.radio(
-        "Source du profil solaire",
-        ["Courbe standard France", "Upload CSV 8760"],
-        horizontal=True,
-    )
-
-    solar_upload = None
-    uploaded_solar_is_relative = True
-
-    if solar_mode == "Upload CSV 8760":
-        solar_upload = st.file_uploader(
-            "Upload du profil solaire CSV (8760 lignes, première colonne numérique)",
-            type=["csv"],
-            key="solar_csv",
-        )
-        uploaded_solar_is_relative = st.checkbox(
-            "Le CSV uploadé est un profil relatif à normaliser sur le productible annuel (sinon : MWh nets horaires absolus)",
-            value=True,
-        )
-
-    st.subheader("Prix PV")
-    pv_price_mode = st.radio("Source du prix de vente du PV", ["Prix moyen annuel", "Upload CSV 8760"], horizontal=True)
-    pv_price_value = None
-    pv_price_upload = None
-
-    if pv_price_mode == "Prix moyen annuel":
-        pv_price_value = st.number_input("Prix moyen PV (EUR/MWh)", value=55.0, step=1.0)
-    else:
-        pv_price_upload = st.file_uploader("Upload prix PV CSV (8760 lignes)", type=["csv"], key="pv_price")
-
-    st.subheader("Prix vente batterie")
-    batt_sell_mode = st.radio("Source du prix de vente de l'énergie shiftée", ["Prix moyen annuel", "Upload CSV 8760"], horizontal=True)
-    batt_sell_value = None
-    batt_sell_upload = None
-
-    if batt_sell_mode == "Prix moyen annuel":
-        batt_sell_value = st.number_input("Prix moyen vente batterie (EUR/MWh)", value=90.0, step=1.0)
-    else:
-        batt_sell_upload = st.file_uploader("Upload prix vente batterie CSV (8760 lignes)", type=["csv"], key="batt_sell")
-
-    st.subheader("Prix d'achat réseau pour charge batterie")
-    grid_mode = st.radio(
-        "Source du prix d'achat réseau",
-        ["Identique au prix vente batterie", "Prix moyen annuel", "Upload CSV 8760"],
-        horizontal=True,
-    )
-    grid_buy_value = None
-    grid_buy_upload = None
-
-    if grid_mode == "Prix moyen annuel":
-        grid_buy_value = st.number_input("Prix moyen achat réseau (EUR/MWh)", value=55.0, step=1.0)
-    elif grid_mode == "Upload CSV 8760":
-        grid_buy_upload = st.file_uploader("Upload prix achat réseau CSV (8760 lignes)", type=["csv"], key="grid_buy")
-
-    st.markdown("---")
-    run = st.button("Lancer la simulation", type="primary")
-
-    with st.expander("Format des CSV attendus", expanded=False):
-        st.markdown(
-            """
-            - **8760 lignes**, une heure par ligne, **première colonne numérique**.
-            - Pas besoin d'en-tête spécifique.
-            - Les décimales avec **point ou virgule** sont acceptées.
-            - Pour le solaire uploadé :
-              - soit **profil relatif** renormalisé sur le productible annuel,
-              - soit **MWh nets horaires absolus** si la case correspondante est décochée.
-            """
-        )
-
-    if not run:
-        return
-
-    try:
-        if batt_energy_mwh < batt_power_mw and batt_energy_mwh > 0:
-            st.warning("Attention : la capacité batterie est inférieure à 1h de puissance. C'est possible, mais atypique.")
-
-        if initial_soc > batt_energy_mwh:
-            st.error("Le SOC initial ne peut pas dépasser la capacité batterie.")
-            return
-
-        if final_soc > batt_energy_mwh:
-            st.error("Le SOC final ne peut pas dépasser la capacité batterie.")
-            return
-
-        # Profil solaire
-        if solar_mode == "Courbe standard France":
-            solar_relative = build_standard_france_solar_profile()
-            pv_hourly_mwh, pv_stats = build_pv_generation_mwh(
-                solar_relative,
-                pv_dc_mw,
-                productible,
-                pv_losses_pct,
-                availability_pct,
-            )
-        else:
-            if solar_upload is None:
-                st.error("Merci d'uploader un CSV solaire 8760.")
-                return
-
-            uploaded = _read_single_column_csv(solar_upload)
-
-            if uploaded_solar_is_relative:
-                pv_hourly_mwh, pv_stats = build_pv_generation_mwh(
-                    uploaded,
-                    pv_dc_mw,
-                    productible,
-                    pv_losses_pct,
-                    availability_pct,
-                )
-            else:
-                pv_hourly_mwh = np.maximum(uploaded, 0.0)
-                annual_net = float(pv_hourly_mwh.sum())
-                annual_dc = float(pv_dc_mw * productible)
-                pv_stats = {
-                    "annual_dc_mwh": annual_dc,
-                    "annual_net_mwh": annual_net,
-                    "annual_losses_mwh": float(max(annual_dc - annual_net, 0.0)),
-                }
-
-        # Courbes de prix
-        pv_price_curve = (
-            _make_flat_curve(pv_price_value)
-            if pv_price_mode == "Prix moyen annuel"
-            else _read_single_column_csv(pv_price_upload)
-        )
-
-        batt_sell_curve = (
-            _make_flat_curve(batt_sell_value)
-            if batt_sell_mode == "Prix moyen annuel"
-            else _read_single_column_csv(batt_sell_upload)
-        )
-
-        if grid_mode == "Identique au prix vente batterie":
-            grid_buy_curve = batt_sell_curve.copy()
-        elif grid_mode == "Prix moyen annuel":
-            grid_buy_curve = _make_flat_curve(grid_buy_value)
-        else:
-            grid_buy_curve = _read_single_column_csv(grid_buy_upload)
-
-        sim_inputs = SimulationInputs(
-            batt_power_mw=batt_power_mw,
-            batt_energy_mwh=batt_energy_mwh,
-            pv_dc_mw=pv_dc_mw,
-            productible_kwh_per_kwp=productible,
-            pv_losses_pct=pv_losses_pct,
-            plant_availability_pct=availability_pct,
-            eta_charge=eta_charge,
-            eta_discharge=eta_discharge,
-            pv_price=pv_price_curve,
-            batt_sell_price=batt_sell_curve,
-            grid_buy_price=grid_buy_curve,
-            solar_profile=pv_hourly_mwh,
-            nightly_bess_revenue_eur=nightly_bess_revenue,
-            soc_steps=soc_steps,
-            initial_soc_mwh=initial_soc,
-            final_soc_mwh=final_soc,
-            grid_export_limit_mw=grid_export_limit_mw,
-            cycle_cost_eur_per_mwh=cycle_cost,
-            charge_quantile=charge_quantile,
-            discharge_quantile=discharge_quantile,
-            max_cycles_per_year=max_cycles,
-        )
-
-        with st.spinner("Optimisation économique annuelle en cours..."):
-            result = optimize_dispatch_dp(sim_inputs)
-
-        summary_df = build_summary_table(result, pv_stats)
-        monthly_df = monthly_dataframe(result)
-
-        idx = pd.date_range(f"{DEFAULT_YEAR}-01-01 00:00:00", periods=HOURS_PER_YEAR, freq="h")
-        hourly_df = pd.DataFrame({
-            "datetime": idx,
-            "pv_generation_mwh": pv_hourly_mwh,
-            "pv_price_eur_per_mwh": pv_price_curve,
-            "battery_sell_price_eur_per_mwh": batt_sell_curve,
-            "grid_buy_price_eur_per_mwh": grid_buy_curve,
-            "pv_direct_mwh": result["pv_direct"],
-            "pv_to_battery_mwh": result["pv_to_batt"],
-            "grid_charge_mwh": result["grid_charge"],
-            "battery_discharge_mwh": result["discharge"],
-            "battery_soc_mwh_end": result["soc"][1:],
-            "pv_direct_revenue_eur": result["pv_direct_revenue"],
-            "battery_sale_revenue_eur": result["batt_sale_revenue"],
-            "grid_charge_cost_eur": result["grid_charge_cost"],
-        })
-
-        excel_bytes = to_excel_bytes(summary_df, monthly_df, hourly_df)
-
-        st.success("Simulation terminée.")
-
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Revenu total", f"{result['total_revenue'][0]:,.0f} EUR")
-        k2.metric("Énergie totale vendue", f"{result['energy_sold_total_mwh'][0]:,.0f} MWh")
-        k3.metric("Énergie shiftée", f"{result['energy_shifted_mwh'][0]:,.0f} MWh")
-        k4.metric("Cycles équivalents", f"{result['equivalent_cycles'][0]:,.1f}")
-
-        st.subheader("Synthèse")
-        st.dataframe(summary_df, use_container_width=True, hide_index=True)
-
-        c1, c2 = st.columns(2)
-
-        with c1:
-            fig1, ax1 = plt.subplots(figsize=(8, 4.5))
-            bars = [
-                float(result["total_direct_pv_revenue"][0]),
-                float(result["total_batt_sale_revenue"][0]),
-                -float(result["total_grid_charge_cost"][0]),
-                float(result["nightly_revenue_total"][0]),
-            ]
-            labels = ["PV direct", "Vente batterie", "Coût charge réseau", "SS nuit"]
-            ax1.bar(labels, bars)
-            ax1.set_title("Décomposition des revenus")
-            ax1.set_ylabel("EUR")
-            ax1.tick_params(axis="x", rotation=20)
-            st.pyplot(fig1)
-            plt.close(fig1)
-
-        with c2:
-            fig2, ax2 = plt.subplots(figsize=(8, 4.5))
-            ax2.plot(monthly_df["month"], monthly_df["net_revenue"])
-            ax2.set_title("Revenu net mensuel")
-            ax2.set_ylabel("EUR")
-            ax2.set_xlabel("Mois")
-            ax2.tick_params(axis="x", rotation=45)
-            st.pyplot(fig2)
-            plt.close(fig2)
-
-        c3, c4 = st.columns(2)
-
-        with c3:
-            fig3, ax3 = plt.subplots(figsize=(8, 4.5))
-            ax3.plot(monthly_df["month"], monthly_df["pv_direct_mwh"], label="PV direct")
-            ax3.plot(monthly_df["month"], monthly_df["shifted_mwh"], label="Énergie shiftée")
-            ax3.set_title("Énergies valorisées par mois")
-            ax3.set_ylabel("MWh")
-            ax3.set_xlabel("Mois")
-            ax3.legend()
-            ax3.tick_params(axis="x", rotation=45)
-            st.pyplot(fig3)
-            plt.close(fig3)
-
-        with c4:
-            # --- Sélection 3 premiers jours de juin ---
-            start_date = pd.Timestamp(f"{DEFAULT_YEAR}-06-01 00:00:00")
-            end_date = start_date + pd.Timedelta(hours=72)
-
-            df = hourly_df[
-                (hourly_df["datetime"] >= start_date) &
-                (hourly_df["datetime"] < end_date)
-            ].copy()
-
-            fig, ax1 = plt.subplots(figsize=(12, 5))
-
-            # --- Aires empilées (flux sortants vers réseau) ---
-            ax1.stackplot(
-                df["datetime"],
-                df["pv_direct_mwh"],
-                df["battery_discharge_mwh"],
-                labels=["PV → Réseau", "Batterie → Réseau"],
-                alpha=0.8
-            )
-
-            # --- Aires négatives (charges batterie) ---
-            ax1.stackplot(
-                df["datetime"],
-                -df["pv_to_battery_mwh"],
-                -df["grid_charge_mwh"],
-                labels=["PV → Batterie", "Réseau → Batterie"],
-                alpha=0.5
-            )
-
-            ax1.axhline(0, linewidth=1)  # ligne zéro
-            ax1.set_ylabel("Flux énergie (MWh)")
-            ax1.set_xlabel("Date")
-
-            # --- Prix (axe secondaire) ---
-            ax2 = ax1.twinx()
-            ax2.plot(
-                df["datetime"],
-                df["pv_price_eur_per_mwh"],  # spot price
-                linestyle="--",
-                alpha=0.7,
-                label="Prix spot"
-            )
-            ax2.set_ylabel("Prix (EUR/MWh)")
-
-            # --- Légende combinée ---
-            lines_1, labels_1 = ax1.get_legend_handles_labels()
-            lines_2, labels_2 = ax2.get_legend_handles_labels()
-            ax1.legend(lines_1 + lines_2, labels_1 + labels_2, loc="upper right")
-
-            ax1.set_title("Dispatch énergétique - 3 premiers jours de juin")
-
-            st.pyplot(fig)
-            plt.close(fig)
-
-        st.subheader("Table mensuelle")
-        st.dataframe(monthly_df, use_container_width=True, hide_index=True)
-
-        st.subheader("Exports")
-        st.download_button(
-            "Télécharger les résultats en Excel",
-            data=excel_bytes,
-            file_name="revenus_hybride_pv_batterie.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-        st.download_button(
-            "Télécharger l'horaire en CSV",
-            data=hourly_df.to_csv(index=False).encode("utf-8"),
-            file_name="dispatch_horaire_hybride.csv",
-            mime="text/csv",
-        )
-
-    except Exception as e:
-        st.error(f"Erreur: {e}")
-
-
-if __name__ == "__main__":
-    app()
+            - Simulation **horaire sur 8760
