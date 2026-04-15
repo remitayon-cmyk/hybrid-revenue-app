@@ -730,27 +730,44 @@ def app():
             plt.close(fig3)
 
         with c4:
-            # --- Sélection première semaine de juin ---
-            june_mask = (hourly_df["datetime"].dt.month == 6)
-            june_df = hourly_df[june_mask].copy()
-            week_df = june_df.iloc[:168]
+            # --- Sélection 3 premiers jours de juin ---
+            start_date = pd.Timestamp(f"{DEFAULT_YEAR}-06-01 00:00:00")
+            end_date = start_date + pd.Timedelta(hours=72)
 
-            fig4, ax1 = plt.subplots(figsize=(10, 5))
+            df = hourly_df[
+                (hourly_df["datetime"] >= start_date) &
+                (hourly_df["datetime"] < end_date)
+            ].copy()
 
-            # --- Flux énergie ---
-            ax1.plot(week_df["datetime"], week_df["pv_direct_mwh"], label="PV → Réseau")
-            ax1.plot(week_df["datetime"], week_df["pv_to_battery_mwh"], label="PV → Batterie")
-            ax1.plot(week_df["datetime"], week_df["grid_charge_mwh"], label="Réseau → Batterie")
-            ax1.plot(week_df["datetime"], week_df["battery_discharge_mwh"], label="Batterie → Réseau")
+            fig, ax1 = plt.subplots(figsize=(12, 5))
 
+            # --- Aires empilées (flux sortants vers réseau) ---
+            ax1.stackplot(
+                df["datetime"],
+                df["pv_direct_mwh"],
+                df["battery_discharge_mwh"],
+                labels=["PV → Réseau", "Batterie → Réseau"],
+                alpha=0.8
+            )
+
+            # --- Aires négatives (charges batterie) ---
+            ax1.stackplot(
+                df["datetime"],
+                -df["pv_to_battery_mwh"],
+                -df["grid_charge_mwh"],
+                labels=["PV → Batterie", "Réseau → Batterie"],
+                alpha=0.5
+            )
+
+            ax1.axhline(0, linewidth=1)  # ligne zéro
             ax1.set_ylabel("Flux énergie (MWh)")
             ax1.set_xlabel("Date")
 
             # --- Prix (axe secondaire) ---
             ax2 = ax1.twinx()
             ax2.plot(
-                week_df["datetime"],
-                week_df["battery_sell_price_eur_per_mwh"],
+                df["datetime"],
+                df["pv_price_eur_per_mwh"],  # spot price
                 linestyle="--",
                 alpha=0.7,
                 label="Prix spot"
@@ -762,10 +779,10 @@ def app():
             lines_2, labels_2 = ax2.get_legend_handles_labels()
             ax1.legend(lines_1 + lines_2, labels_1 + labels_2, loc="upper right")
 
-            ax1.set_title("Flux énergétiques et prix - Première semaine de juin")
+            ax1.set_title("Dispatch énergétique - 3 premiers jours de juin")
 
-            st.pyplot(fig4)
-            plt.close(fig4)
+            st.pyplot(fig)
+            plt.close(fig)
 
         st.subheader("Table mensuelle")
         st.dataframe(monthly_df, use_container_width=True, hide_index=True)
